@@ -1,0 +1,162 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/types.h>
+#include <stdbool.h>
+
+#define MAX_PEDIDOS 10
+#define PEDIDO_LEN 64
+
+typedef struct {
+    int cliente_id;
+    char pedido[PEDIDO_LEN];
+    int estado; // 0: vacío, 1: recibido, 2: preparado
+} Pedido;
+
+typedef struct {
+    Pedido pedidos[MAX_PEDIDOS];
+    int in;  // posición para insertar
+    int out; // posición para atender
+    bool mutex; // bandera de bloqueo simple
+} ColaPedidos;
+
+void esperar_mutex(ColaPedidos *cola) {
+    while (__sync_lock_test_and_set(&cola->mutex, true)) {
+        usleep(100000); // espera activa simple
+    }
+}
+
+void liberar_mutex(ColaPedidos *cola) {
+    __sync_lock_release(&cola->mutex);
+}
+
+// Cliente: envía un pedido y espera confirmación
+void cliente(int cliente_id) {
+    key_t key = 1234;
+    int shmid = shmget(key, sizeof(ColaPedidos), 0666);
+    if (shmid == -1) {
+        perror("Error obteniendo memoria compartida");
+        exit(1);
+    }
+
+    ColaPedidos *cola = (ColaPedidos *)shmat(shmid, NULL, 0);
+    if (cola == (void *)-1) {
+        perror("Error al adjuntar memoria");
+        exit(1);
+    }
+
+    Pedido nuevo;
+    nuevo.cliente_id = cliente_id;
+    nuevo.estado = 1;
+
+    printf("Cliente #%d - Ingresa tu pedido: ", cliente_id);
+    fgets(nuevo.pedido, PEDIDO_LEN, stdin);
+    nuevo.pedido[strcspn(nuevo.pedido, "\n")] = '\0'; // quitar salto de línea
+
+    bool enviado = false;
+    while (!enviado) {
+        esperar_mutex(cola);
+        for (int i = 0; i < MAX_PEDIDOS; i++) {
+            int idx = (cola->in + i) % MAX_PEDIDOS;
+            if (cola->pedidos[idx].estado == 0) {
+                cola->pedidos[idx] = nuevo;
+                cola->in = (idx + 1) % MAX_PEDIDOS;
+                printf("Cliente #%d - Pedido enviado: %s\n", cliente_id, nuevo.pedido);
+                enviado = true;
+                break;
+            }
+        }
+        liberar_mutex(cola);
+        if (!enviado) usleep(500000);
+    }
+
+    // Esperar confirmación
+    bool preparado = false;
+    while (!preparado) {
+        esperar_mutex(cola);
+        for (int i = 0; i < MAX_PEDIDOS; i++) {
+            if (cola->pedidos[i].cliente_id == cliente_id && cola->pedidos[i].estado == 2) {
+                printf("Cliente #%d - Pedido preparado: %s\n", cliente_id, cola->pedidos[i].pedido);
+                cola->pedidos[i].estado = 0; // liberar espacio
+                preparado = true;
+                break;
+            }
+        }
+        liberar_mutex(cola);
+        if (!preparado) usleep(500000);
+    }
+
+    shmdt(cola);
+}
+
+// Cocina: procesa pedidos en orden
+void cocina() {
+    key_t key = 1234;
+    int shmid = shmget(key, sizeof(ColaPedidos), IPC_CREAT | 0666);
+    if (shmid == -1) {
+        perror("Error creando memoria compartida");
+        exit(1);
+    }
+
+    ColaPedidos *cola = (ColaPedidos *)shmat(shmid, NULL, 0);
+    if (cola == (void *)-1) {
+        perror("Error al adjuntar memoria");
+        exit(1);
+    }
+
+    // Inicializar memoria compartida si es primera vez
+    esperar_mutex(cola);
+    for (int i = 0; i < MAX_PEDIDOS; i++) {
+        cola->pedidos[i].estado = 0;
+    }
+    cola->in = 0;
+    cola->out = 0;
+    cola->mutex = false;
+    liberar_mutex(cola);
+
+    printf("Cocina lista para atender pedidos...\n");
+
+    while (1) {
+        esperar_mutex(cola);
+        bool atendido = false;
+        for (int i = 0; i < MAX_PEDIDOS; i++) {
+            int idx = (cola->out + i) % MAX_PEDIDOS;
+            if (cola->pedidos[idx].estado == 1) {
+                printf("Cocina - Atendiendo pedido de cliente #%d: %s\n", cola->pedidos[idx].cliente_id, cola->pedidos[idx].pedido);
+                sleep(2); // Simula tiempo de preparación
+                cola->pedidos[idx].estado = 2;
+                cola->out = (idx + 1) % MAX_PEDIDOS;
+                atendido = true;
+                break;
+            }
+        }
+        liberar_mutex(cola);
+        if (!atendido) usleep(300000); // espera si no hay pedidos
+    }
+
+    shmdt(cola);
+    shmctl(shmid, IPC_RMID, NULL);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        printf("Uso: %s [cocina | cliente ID]\n", argv[0]);
+        return 1;
+    }
+
+    if (strcmp(argv[1], "cocina") == 0) {
+        cocina();
+    } else {
+        int cliente_id = atoi(argv[1]);
+        if (cliente_id <= 0) {
+            printf("ID de cliente inválido\n");
+            return 1;
+        }
+        cliente(cliente_id);
+    }
+
+    return 0;
+}
